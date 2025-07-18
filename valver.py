@@ -1,7 +1,8 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters 
-import json, os, asyncio, valve.source.a2s
+import json, os, asyncio, valve.source.a2s, time
 from PIL import Image, ImageDraw, ImageFont
+from valve.source import a2s, NoResponseError
 from io import BytesIO
 from datetime import datetime, timedelta
 from analyzer import players_analyzer, app_timezone as operating_timezone
@@ -283,21 +284,40 @@ def LocalParser(serverData, language):
     return build_players_string(players_list, info, lang=language)
 
 def GetServerData(user_lang="EN", for_background_task=False):
-    with valve.source.a2s.ServerQuerier(server_address) as server:
-        global server_data 
-        info = server.info()
-        players_data = server.players()
-        server_data = {
-            "info": dict(info),
-            "players": dict(players_data)
-        }
-        PlayersStat(server_data['players']['players'])
-        players_list = get_players(players_data, user_lang)
-        if(not for_background_task): return build_players_string(players_list, info, lang=user_lang)
-        else: return players_data, players_list
+    max_retries = 3
+    delay = 1  # seconds
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            with a2s.ServerQuerier(server_address) as server:
+                global server_data 
+                info = server.info()
+                players_data = server.players()
+                server_data = {
+                    "info": dict(info),
+                    "players": dict(players_data)
+                }
+                PlayersStat(server_data['players']['players'])
+                players_list = get_players(players_data, user_lang)
+                
+                if not for_background_task:
+                    return build_players_string(players_list, info, lang=user_lang)
+                else:
+                    return players_data, players_list
+
+        except NoResponseError as e:
+            print(f"[WARN] Attempt {attempt}/{max_retries}: No response from server: {e}")
+        except Exception as e:
+            print(f"[ERROR] Attempt {attempt}/{max_retries}: Unexpected error: {type(e).__name__}: {e}")
+        
+        if attempt < max_retries:
+            time.sleep(delay)
+
+    print("[FAIL] Server query failed after 3 attempts.")
+    return None
 
 
-BOT_TOKEN = "" #Bot Token Right Here
+BOT_TOKEN = ""
 
 LANGUAGE_CHOICES = [["EN", "RU"]]
 
@@ -323,7 +343,7 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_
         )
     else:
         await update.message.reply_text(
-            message_text,
+            message_text,   
             reply_markup=reply_markup
         )
 
@@ -342,19 +362,6 @@ async def show_cube_choices(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         message_text,
         reply_markup=cube_inline_keyboard(lang)
     )
-
-async def send_loading_notice(update: Update, context: ContextTypes.DEFAULT_TYPE, language="EN", delay=3):
-    try:
-        async def PerformLoading():
-            msg = await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⏳ Loading, please wait..." if language == "EN" else "⏳ Загрузка, пожалуйста, подождите..."
-            )
-            await asyncio.sleep(delay)
-            await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
-        asyncio.create_task(PerformLoading())
-    except Exception as e:
-        print(f"Error in send_loading_notice: {e}")
 
 async def handle_status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -410,7 +417,7 @@ def VerifiedName():
     for each_player in players:
         player_name = each_player['name']
         player_played = each_player['duration']
-        played_30_secs = int(player_played) >= 30
+        played_30_secs = int(player_played) >= 32
         if (not player_name) and (not played_30_secs): return False
     return True 
 
@@ -485,7 +492,6 @@ def get_persistent_menu(lang):
             [KeyboardButton("⏰ Set Alarm")],
             [KeyboardButton("📊 Player Stats")]
         ]
-
     return ReplyKeyboardMarkup(
         buttons,
         resize_keyboard=True,
@@ -499,7 +505,6 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
     requesting_user = users.get(user_id, {})
     lang = requesting_user.get('language', "EN")
-    await send_loading_notice(update, context, lang, 0.5)
     data_exists = len(server_data.keys()) > 0
     text_output = LocalParser(server_data, lang) if data_exists else GetServerData(user_lang=lang)
     img = render_text_image(text_output, font_size=30)
@@ -508,8 +513,10 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buffer.seek(0)
     await update.message.reply_photo(
         photo=buffer,
-        caption="🎮 Статус" if lang == "RU" else "🎮 Server Status"
+        caption="🎮 Статус" if lang == "RU" else "🎮 Server Status",
+        reply_markup=get_persistent_menu(lang)
     )
+    
 
 def get_alarm_inline_keyboard(lang):
     if lang == "RU":
@@ -576,15 +583,18 @@ async def AlertMessageSender(app, user_id: str, lang: str = "EN", message: str =
     buffer = BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
+
     try:
         await app.bot.send_photo(
             chat_id=int(user_id),
             photo=buffer,
-            caption= message,
+            caption=message,
+            reply_markup=get_persistent_menu(lang)
         )
         print(f"[ALERT MESSAGE SENT] to {user_id}")
     except Exception as e:
         print(f"[ERROR] Failed to send alert image to {user_id}: {e}")
+
 
 
 def reset_alarm(users={}, user_id='', language="EN"):
@@ -607,16 +617,25 @@ async def AlertUser(app, user_id, player_count, language, users):
 
 async def background_player_tracker(app):
     while True:
-        players_data, players_list = GetServerData(for_background_task=True)
+        result = GetServerData(for_background_task=True)
+        if result is None:
+            print("[Tracker] Failed to get server data. Retrying after delay...")
+            await asyncio.sleep(3.5)
+            continue
+        players_data, players_list = result
         players_count = len(players_list)
         print(f"[Tracker] players: {players_count}")
+
         users = load_users()
         for user_id, data in users.items():
             alarm_value = data.get("players_alarm", 0)
             language = data.get("language", 'EN')
             if is_alarm_triggered(alarm_value, players_count): 
                 await AlertUser(app, user_id, players_count, language, users)
-        await asyncio.sleep(3)
+
+        await asyncio.sleep(3.3)
+
+
 
 async def handle_stats_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -688,8 +707,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_stats_selection, pattern=r"^(today|yesterday|weekly|monthly)-stats$"))
     app.add_handler(CallbackQueryHandler(handle_language_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_status_button))
-    app.add_handler(CallbackQueryHandler(handle_stats_selection, pattern=r"^(today|yesterday|weekly|monthly)-stats$"))
-
+    # app.add_handler(CallbackQueryHandler(handle_stats_selection, pattern=r"^(today|yesterday|weekly|monthly)-stats$"))
+    print('[BOT_TOKEN]:', BOT_TOKEN)
     app.run_polling()
 
 if __name__ == "__main__":
